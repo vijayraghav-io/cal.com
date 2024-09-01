@@ -4,11 +4,16 @@ import dayjs from "@calcom/dayjs";
 import { sendBookingRedirectNotification } from "@calcom/emails";
 import { getTranslation } from "@calcom/lib/server";
 import prisma from "@calcom/prisma";
+import { MembershipRole } from "@calcom/prisma/enums";
 import type { TrpcSessionUser } from "@calcom/trpc/server/trpc";
 
 import { TRPCError } from "@trpc/server";
 
-import type { TOutOfOfficeDelete, TOutOfOfficeInputSchema } from "./outOfOffice.schema";
+import type {
+  TOutOfOfficeDelete,
+  TOutOfOfficeEntriesListSchema,
+  TOutOfOfficeInputSchema,
+} from "./outOfOffice.schema";
 
 type TBookingRedirect = {
   ctx: {
@@ -17,7 +22,36 @@ type TBookingRedirect = {
   input: TOutOfOfficeInputSchema;
 };
 
-export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
+// function getTeam() checks if there is a team where input 'adminUserId' is admin or owner
+// and input 'memberUserId' is a member.
+// If exists returns the first found such team.
+const getTeam = async (adminUserId: number, memberUserId: number) => {
+  return await prisma.team.findFirst({
+    where: {
+      AND: [
+        {
+          members: {
+            some: {
+              userId: adminUserId,
+              role: {
+                in: [MembershipRole.ADMIN, MembershipRole.OWNER],
+              },
+            },
+          },
+        },
+        {
+          members: {
+            some: {
+              userId: memberUserId,
+            },
+          },
+        },
+      ],
+    },
+  });
+};
+
+export const outOfOfficeCreateOrUpdate = async ({ ctx, input }: TBookingRedirect) => {
   const { startDate, endDate } = input.dateRange;
   if (!startDate || !endDate) {
     throw new TRPCError({ code: "BAD_REQUEST", message: "start_date_and_end_date_required" });
@@ -44,6 +78,18 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
     throw new TRPCError({ code: "BAD_REQUEST", message: "start_date_must_be_in_the_future" });
   }
 
+  let oooCreatingForUserId = ctx.user.id;
+
+  // Check If Admin or Owner is trying to create OOO for their team member, and is valid.
+  let commonTeam;
+  if (input.forUserId) {
+    commonTeam = await getTeam(ctx.user.id, input.forUserId);
+    if (!commonTeam) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "only_admin_can_create_ooo" });
+    }
+    oooCreatingForUserId = input.forUserId;
+  }
+
   let toUserId;
 
   if (input.toTeamUserId) {
@@ -56,7 +102,7 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
             team: {
               members: {
                 some: {
-                  userId: ctx.user.id,
+                  userId: oooCreatingForUserId,
                   accepted: true,
                 },
               },
@@ -69,7 +115,10 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
       },
     });
     if (!user) {
-      throw new TRPCError({ code: "NOT_FOUND", message: "user_not_found" });
+      throw new TRPCError({
+        code: "NOT_FOUND",
+        message: input.forUserId ? "forward_to_team_member_only" : "user_not_found",
+      });
     }
     toUserId = user?.id;
   }
@@ -78,7 +127,7 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
   const outOfOfficeEntry = await prisma.outOfOfficeEntry.findFirst({
     where: {
       AND: [
-        { userId: ctx.user.id },
+        { userId: oooCreatingForUserId },
         {
           OR: [
             {
@@ -105,6 +154,14 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
             },
           ],
         },
+        // For update scenario, ignore the row that is being updated
+        !!input.uuid
+          ? {
+              uuid: {
+                not: input.uuid,
+              },
+            }
+          : {},
       ],
     },
   });
@@ -126,7 +183,7 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
     },
     where: {
       userId: toUserId,
-      toUserId: ctx.user.id,
+      toUserId: oooCreatingForUserId,
       // Check for time overlap or collision
       OR: [
         // Outside of range
@@ -144,29 +201,57 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
           ],
         },
       ],
+      // For update scenario, ignore the row that is being updated
+      uuid: !!input.uuid
+        ? {
+            not: input.uuid,
+          }
+        : {},
     },
   });
 
   // don't allow infinite redirects
   if (existingOutOfOfficeEntry) {
-    throw new TRPCError({ code: "BAD_REQUEST", message: "booking_redirect_infinite_not_allowed" });
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: input.forUserId
+        ? "ooo_team_redirect_infinite_not_allowed"
+        : "booking_redirect_infinite_not_allowed",
+    });
   }
   const startDateUtc = dayjs.utc(startDate).add(input.offset, "minute");
   const endDateUtc = dayjs.utc(endDate).add(input.offset, "minute");
 
-  const createdRedirect = await prisma.outOfOfficeEntry.create({
-    data: {
-      uuid: uuidv4(),
-      start: startDateUtc.startOf("day").toISOString(),
-      end: endDateUtc.endOf("day").toISOString(),
-      notes: input.notes,
-      userId: ctx.user.id,
-      reasonId: input.reasonId,
-      toUserId: toUserId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    },
-  });
+  let oooEntry;
+  if (!!input.uuid) {
+    oooEntry = await prisma.outOfOfficeEntry.update({
+      where: {
+        uuid: input.uuid,
+      },
+      data: {
+        start: startDateUtc.startOf("day").toISOString(),
+        end: endDateUtc.endOf("day").toISOString(),
+        notes: input.notes,
+        reasonId: input.reasonId,
+        toUserId: toUserId,
+        updatedAt: new Date(),
+      },
+    });
+  } else {
+    oooEntry = await prisma.outOfOfficeEntry.create({
+      data: {
+        uuid: uuidv4(),
+        start: startDateUtc.startOf("day").toISOString(),
+        end: endDateUtc.endOf("day").toISOString(),
+        notes: input.notes,
+        userId: oooCreatingForUserId,
+        reasonId: input.reasonId,
+        toUserId: toUserId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+  }
 
   if (toUserId) {
     // await send email to notify user
@@ -176,17 +261,18 @@ export const outOfOfficeCreate = async ({ ctx, input }: TBookingRedirect) => {
       },
       select: {
         email: true,
+        username: true,
       },
     });
     const t = await getTranslation(ctx.user.locale ?? "en", "common");
-    const formattedStartDate = new Intl.DateTimeFormat("en-US").format(createdRedirect.start);
-    const formattedEndDate = new Intl.DateTimeFormat("en-US").format(createdRedirect.end);
+    const formattedStartDate = new Intl.DateTimeFormat("en-US").format(oooEntry.start);
+    const formattedEndDate = new Intl.DateTimeFormat("en-US").format(oooEntry.end);
     if (userToNotify?.email) {
       await sendBookingRedirectNotification({
         language: t,
         fromEmail: ctx.user.email,
         toEmail: userToNotify.email,
-        toName: ctx.user.username || "",
+        toName: userToNotify.username || "",
         dates: `${formattedStartDate} - ${formattedEndDate}`,
       });
     }
@@ -207,31 +293,137 @@ export const outOfOfficeEntryDelete = async ({ ctx, input }: TBookingRedirectDel
     throw new TRPCError({ code: "BAD_REQUEST", message: "out_of_office_id_required" });
   }
 
-  const deletedOutOfOfficeEntry = await prisma.outOfOfficeEntry.delete({
-    where: {
-      uuid: input.outOfOfficeUid,
-      /** Validate outOfOfficeEntry belongs to the user deleting it */
-      userId: ctx.user.id,
-    },
-  });
-
-  if (!deletedOutOfOfficeEntry) {
-    throw new TRPCError({ code: "NOT_FOUND", message: "booking_redirect_not_found" });
+  try {
+    await prisma.outOfOfficeEntry.delete({
+      where: {
+        uuid: input.outOfOfficeUid,
+        /** Validate outOfOfficeEntry belongs to the user deleting it */
+        userId: ctx.user.id,
+      },
+    });
+  } catch {
+    // Check if admin is trying to delete member's OOO Entry
+    const oooEntry = await prisma.outOfOfficeEntry.findUnique({
+      where: {
+        uuid: input.outOfOfficeUid,
+      },
+      select: {
+        userId: true,
+      },
+    });
+    if (!!oooEntry) {
+      // check if context user is admin of member
+      const commonTeam = await getTeam(ctx.user.id, oooEntry.userId);
+      if (!commonTeam) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "only_admin_can_delete_ooo" });
+      }
+      const deletedOutOfOfficeEntry = await prisma.outOfOfficeEntry.delete({
+        where: {
+          uuid: input.outOfOfficeUid,
+        },
+      });
+      if (!deletedOutOfOfficeEntry) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "booking_redirect_not_found" });
+      }
+    } else {
+      throw new TRPCError({ code: "NOT_FOUND", message: "booking_redirect_not_found" });
+    }
   }
 
   return {};
 };
 
-export const outOfOfficeEntriesList = async ({ ctx }: { ctx: { user: NonNullable<TrpcSessionUser> } }) => {
+type GetOptions = {
+  ctx: {
+    user: NonNullable<TrpcSessionUser>;
+  };
+  input: TOutOfOfficeEntriesListSchema;
+};
+
+export const outOfOfficeEntriesList = async ({ ctx, input }: GetOptions) => {
+  const { cursor, limit, fetchTeamMembersEntries, searchTerm } = input;
+  let fetchOOOEntriesForIds = [ctx.user.id];
+
+  if (fetchTeamMembersEntries) {
+    // Get teams where context user is admin or owner
+    const teams = await prisma.membership.findMany({
+      where: {
+        userId: ctx.user.id,
+        OR: [{ role: MembershipRole.ADMIN }, { role: MembershipRole.OWNER }],
+      },
+      select: {
+        teamId: true,
+      },
+    });
+    if (teams.length === 0) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "user_not_admin_nor_owner" });
+    }
+
+    // Fetch team member user ids
+    const members = await prisma.membership.findMany({
+      where: {
+        teamId: {
+          in: teams.map((team) => team.teamId),
+        },
+        userId: {
+          not: ctx.user.id,
+        },
+      },
+      select: {
+        userId: true,
+      },
+    });
+    if (members.length === 0) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "no_team_members" });
+    }
+    fetchOOOEntriesForIds = members.map((member) => member.userId);
+  }
+
+  const getTotalEntries = await prisma.outOfOfficeEntry.count({
+    where: {
+      userId: {
+        in: fetchOOOEntriesForIds,
+      },
+      ...(searchTerm && {
+        user: {
+          OR: [
+            {
+              email: {
+                contains: searchTerm,
+              },
+            },
+            {
+              username: {
+                contains: searchTerm,
+              },
+            },
+          ],
+        },
+      }),
+    },
+  });
+
   const outOfOfficeEntries = await prisma.outOfOfficeEntry.findMany({
     where: {
-      userId: ctx.user.id,
-      end: {
-        gte: new Date().toISOString(),
+      userId: {
+        in: fetchOOOEntriesForIds,
       },
-    },
-    orderBy: {
-      start: "asc",
+      ...(searchTerm && {
+        user: {
+          OR: [
+            {
+              email: {
+                contains: searchTerm,
+              },
+            },
+            {
+              username: {
+                contains: searchTerm,
+              },
+            },
+          ],
+        },
+      }),
     },
     select: {
       id: true,
@@ -253,8 +445,35 @@ export const outOfOfficeEntriesList = async ({ ctx }: { ctx: { user: NonNullable
         },
       },
       notes: true,
+      user: fetchTeamMembersEntries
+        ? {
+            select: {
+              id: true,
+              username: true,
+              email: true,
+              avatarUrl: true,
+            },
+          }
+        : false,
     },
+    orderBy: {
+      end: "desc",
+    },
+    cursor: cursor ? { id: cursor } : undefined,
+    take: limit + 1,
   });
 
-  return outOfOfficeEntries;
+  let nextCursor: number | undefined = undefined;
+  if (outOfOfficeEntries && outOfOfficeEntries.length > limit) {
+    const nextItem = outOfOfficeEntries.pop();
+    nextCursor = nextItem?.id;
+  }
+
+  return {
+    rows: outOfOfficeEntries || [],
+    nextCursor,
+    meta: {
+      totalRowCount: getTotalEntries || 0,
+    },
+  };
 };
