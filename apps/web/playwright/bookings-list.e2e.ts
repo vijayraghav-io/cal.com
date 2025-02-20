@@ -210,6 +210,7 @@ test.describe("Bookings", () => {
       webhookReceiver.close();
     });
   });
+
   test("Admin bookings filtered by default", async ({ page, users, bookings }) => {
     const t = await localize("en");
     const firstUser = await users.create(
@@ -261,10 +262,7 @@ test.describe("Bookings", () => {
       organizer: secondUser,
       relativeDate: 2,
       organizerEventType: secondUser.eventTypes[0],
-      attendees: [
-        { name: "First", email: firstUser.email, timeZone: "Europe/Berlin" },
-        { name: "Third", email: thirdUser.email, timeZone: "Europe/Berlin" },
-      ],
+      attendees: [{ name: "Third", email: thirdUser.email, timeZone: "Europe/Berlin" }],
     });
     await createBooking({
       title: "SecondUser as Organizer Meeting 2",
@@ -272,10 +270,7 @@ test.describe("Bookings", () => {
       organizer: secondUser,
       relativeDate: 4,
       organizerEventType: secondUser.eventTypes[0],
-      attendees: [
-        { name: "First", email: firstUser.email, timeZone: "Europe/Berlin" },
-        { name: "Third", email: thirdUser.email, timeZone: "Europe/Berlin" },
-      ],
+      attendees: [{ name: "Third", email: thirdUser.email, timeZone: "Europe/Berlin" }],
     });
 
     //admin login
@@ -306,15 +301,15 @@ test.describe("Bookings", () => {
     bookings,
   }) => {
     const firstUser = await users.create(
-      { name: "First", email: "first@cal.com" },
+      { name: "First", email: "firstuser@example.com" },
       {
         hasTeam: true,
         teamRole: MembershipRole.ADMIN,
       }
     );
     const teamId = (await firstUser.getFirstTeamMembership()).teamId;
-    const secondUser = await users.create({ name: "Second", email: "second@cal.com" });
-    const thirdUser = await users.create({ name: "Third", email: "third@cal.com" });
+    const secondUser = await users.create({ name: "Second", email: "seconduser@example.com" });
+    const thirdUser = await users.create({ name: "Third", email: "thirduser@example.com" });
     // Add teammates to the team
     await prisma.membership.createMany({
       data: [
